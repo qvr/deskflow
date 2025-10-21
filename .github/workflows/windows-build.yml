@@ -1,0 +1,104 @@
+name: Windows Build
+
+on:
+  workflow_dispatch:
+
+env:
+  GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+  PACKAGE_PREFIX: "deskflow"
+  PACKAGE_PATH: ./dist
+  CMAKE_CONFIGURE: "cmake -Bbuild -DCMAKE_BUILD_TYPE=Release -DSKIP_BUILD_TESTS=ON -DCMAKE_COMPILE_WARNING_AS_ERROR=ON"
+
+jobs:
+  lint-reuse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: REUSE Compliance Check
+        uses: fsfe/reuse-action@v5
+
+  lint-clang:
+    needs: [lint-reuse]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Lint Checker
+        uses: ./.github/actions/lint-clang
+
+  main-build:
+    needs: lint-clang
+    name: ${{ matrix.target.name }}
+    runs-on: ${{ matrix.target.runs-on }}
+    container: ${{ matrix.target.container }}
+    timeout-minutes: ${{ matrix.target.timeout }}
+    strategy:
+      # Normally, we want to fail fast, but in this case we shouldn't since one target may
+      # fail due to transient issues unrelated to the build.
+      fail-fast: false
+
+      matrix:
+        target:
+          - name: "windows-2022-x64"
+            runs-on: "windows-2022"
+            timeout: 30
+            config-args: "-G Ninja"
+            vcpkg-triplet: x64-windows-release
+            arch: "amd64"
+
+    steps:
+      # Fancy checkout gets all the tags
+      # it also makes sure we can use git --describe correctly
+      - name: Fancy Checkout
+        uses: sithlord48/fancy-checkout@v1
+
+      # This effectively runs `vcvarsall.bat`, etc. It's not actually installing
+      # VC++ as that's already pre-installed on the Windows runner.
+      - name: Setup VC++ environment
+        if: ${{ runner.os == 'Windows' }}
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{matrix.target.arch}}
+
+      - name: Install dependencies
+        id: get-deps
+        uses: ./.github/actions/install-dependencies
+        with:
+          qt-version: 6.10.0
+          vcpkg-triplet: ${{matrix.target.vcpkg-triplet}}
+          like: ${{ matrix.target.like }}
+
+      - name: Get version
+        uses: ./.github/actions/get-version
+
+      - name: Configure
+        run: ${{env.CMAKE_CONFIGURE}} ${{ matrix.target.config-args }} ${{ steps.get-deps.outputs.vcpkg-cmake-config }} -DPACKAGE_VERSION_LABEL="${{env.DESKFLOW_PACKAGE_VERSION}}"
+
+      - name: Build
+        shell: bash
+        run: |
+          if [[ "${{matrix.target.like}}" != "arch" ]]; then
+            cmake --build build --config Release -j8 --target package
+          else
+            cmake --build build --config Release -j8
+            useradd -m build
+            sudo chown -R build build
+            cd build
+            sudo -u build makepkg -s
+            export OSNAME=$(cat /etc/os-release | grep ^ID= | sed 's/ID=//g')
+            export ARCH=$(uname -m)
+            mv *.pkg.tar.zst deskflow-${{env.DESKFLOW_PACKAGE_VERSION}}-${OSNAME}-${ARCH}.pkg.tar.zst
+            cd ..
+          fi
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ env.PACKAGE_PREFIX }}-${{ matrix.target.name }}
+          path: ${{github.workspace}}/build/deskflow[-_]*.*
